@@ -11,12 +11,19 @@ export const validateInt: (minInclusive: number, maxInclusive: number) => Custom
   };
 };
 
+export const validateStringArray: (separator: string, constraint: ParamConstraint) => CustomValidatorFunction = (separator, constraint) =>
+{
+  return (value: any) =>
+  {
+    const array = value.toString().split(separator);
+    return validateArray(constraint)(array);
+  };
+};
+
 export const validateArray: (constraint: ParamConstraint) => CustomValidatorFunction = (constraint: ParamConstraint) =>
 {
   return (value: any) =>
   {
-    value = JSON.parse(value);
-
     return {
       success: Array.isArray(value) && value.every(v => validateParam(v, constraint)),
       value

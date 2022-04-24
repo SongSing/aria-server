@@ -7,24 +7,19 @@ import cors from 'cors';
 import settingsRouter from './routes/settings';
 import tracksRouter from './routes/tracks';
 import playlistsRouter from './routes/playlists';
-import { loadTracks } from './library';
+import { createThumbnails, initLibrary, loadTracks } from './library';
 import db, { tables } from './lib/db';
 import { filesFromDirectoryRS } from './lib/utils';
 import { Dirent } from 'fs';
-import { initDb, sequelize } from './lib/dbsql';
+import { initDb } from './lib/dbsql';
+import { spawnSync } from 'child_process';
 
 Promise.all([
-  sequelize.authenticate(),
   initDb()
 ]).then(init);
 
 async function init() {
-  const libPaths = db.get('0.libraryPaths', { table: tables.settings }) as string[];
-  const files: { filepath: string, stat: Dirent }[] = [];
-  libPaths.forEach((path) => {
-    files.push(...filesFromDirectoryRS(path));
-  });
-  await loadTracks(files.map(f => f.filepath));
+  await initLibrary();
 
   const app = express();
   const port = 9005;
@@ -39,15 +34,26 @@ async function init() {
     next();
   });
 
+  // app.use((req, res, next) => {
+
+  // });
+
   app.use('/settings', settingsRouter);
   app.use('/tracks', tracksRouter);
   app.use('/playlists', playlistsRouter);
   app.use('/data', express.static(path.join(__dirname, '../data')));
-  console.log(path.join(__dirname, '../data'));
 
   app.get('/', (req, res) =>
   {
     res.send('hi');
+  });
+
+  app.post('/refresh', async (req, res) => {
+    await initLibrary();
+  });
+
+  app.post('/createThumbnails', async (req, res) => {
+    createThumbnails();
   });
 
   const server = http.createServer(app);

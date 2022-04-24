@@ -2,10 +2,11 @@ import { Track, TrackMetadata, TrackSettings } from "./lib/types";
 import * as mm from "music-metadata";
 import * as path from "path";
 import * as fs from "fs";
-import { bigintStat, bigintStatSync, getUserDataPath, keysOf } from "./lib/utils";
+import { bigintStat, bigintStatSync, filesFromDirectoryRS, getUserDataPath, keysOf, makeUserDataPath } from "./lib/utils";
 import { mapObject } from "./lib/objectUtils";
-import { sequelize, TrackModel, TrackRelListenEntry } from "./lib/dbsql";
-import { Model, Op } from "sequelize/dist";
+import { escapeSqlString, sql, query as sqlQuery } from "./lib/dbsql";
+import { spawnSync } from "child_process";
+import db, { tables } from "./lib/db";
 
 const formats = [ ".mp3", ".m4a", ".wav", ".flac" ];
 
@@ -126,6 +127,12 @@ export function loadMetadataFromFile(filepath: string): Promise<{ metadata: Trac
 {
   const fid = bigintStatSync(filepath).ino.toString();
 
+  makeUserDataPath();
+  const imgPath = path.join(getUserDataPath(), 'images');
+
+  try { fs.unlinkSync(imgPath); } catch (e) {}
+  try { fs.mkdirSync(imgPath); } catch (e) {}
+
   return new Promise((resolve: (value: { metadata: TrackMetadata, fid: string }) => void, reject) =>
   {
     mm.parseFile(filepath, {
@@ -133,20 +140,8 @@ export function loadMetadataFromFile(filepath: string): Promise<{ metadata: Trac
     }).then((metadata) =>
     {
       let src = "";
-  
-      if (metadata.common.picture && metadata.common.picture[0])
-      {
-        let format = metadata.common.picture[0].format;
-        format = format.substr(format.indexOf("/") + 1);
-  
-        src = path.join(getUserDataPath(), fid + "." + format);
 
-        fs.writeFile(src, metadata.common.picture[0].data, (err) => {
-          if (err) reject(err);
-        });
-      }
-
-      bigintStat(filepath, (err, stats) =>
+      bigintStat(filepath, async (err, stats) =>
       {
         if (err)
         {
@@ -160,10 +155,31 @@ export function loadMetadataFromFile(filepath: string): Promise<{ metadata: Trac
             artist: metadata.common.artist || DefaultMetadata.artist!,
             length: metadata.format.duration || 0,
             modified: stats.mtimeMs.toString(),
-            picture: src,
             title: metadata.common.title || DefaultMetadata.title!,
             track: metadata.common.track.no ?? -1,
           } as TrackMetadata;
+
+          const query: string = `
+            INSERT INTO tracks (fid, title, artist, album, length, track, modified)
+            OUTPUT inserted.id
+            VALUES (${fid}, ${escapeSqlString(ret.title)}, ${escapeSqlString(ret.artist)},
+                      ${escapeSqlString(ret.album)}, ${ret.length},
+                      ${ret.track}, ${ret.modified});
+          `;
+  
+          const { id } = (await sqlQuery(query)).recordset[0];
+  
+          if (metadata.common.picture && metadata.common.picture[0])
+          {
+            let format = metadata.common.picture[0].format;
+            format = format.substr(format.indexOf("/") + 1);
+      
+            src = path.join(imgPath, id + "." + format);
+
+            fs.writeFile(src, metadata.common.picture[0].data, (err) => {
+              if (err) reject(err);
+            });
+          }
     
           resolve({ metadata: ret, fid });
         }
@@ -217,6 +233,24 @@ function cullDeleted(cache: Record<string, TrackMetadata>)
  */
 export const pathMap = new Map<string, string>();
 
+export async function initLibrary() {
+  const libPaths = db.get('0.libraryPaths', { table: tables.settings }) as string[];
+  const files: { filepath: string, stat: fs.Dirent }[] = [];
+  libPaths.forEach((path) => {
+    files.push(...filesFromDirectoryRS(path));
+  });
+  await loadTracks(files.map(f => f.filepath));
+}
+
+export function createThumbnails() {
+  const python = spawnSync('py', [path.join(__dirname, '../src/lib/resizeImages.py')], {
+    cwd: path.join(__dirname, '../')
+  });
+
+  console.log(python.output.toString());
+  console.log('images resized');
+}
+
 /**
  * Will also create/update cache.
  * @param filepaths filepaths of the tracks
@@ -231,20 +265,8 @@ export function loadTracks(filepaths: string[])
     {
       console.timeEnd("loaded tracks");
       // migrateTracks();
-
-      await TrackModel.bulkCreate(loadedTracks.map((t) => ({
-        fid: t.fid,
-        path: t.path,
-        ...t.metadata,
-        ...t.settings,
-        listenEntries: t.listenEntries.map((le) => ({
-          started: new Date(le.started).toISOString(),
-          ended: new Date(le.ended).toISOString()
-        }))
-      })), {
-        include: [TrackRelListenEntry]
-      });
-
+      
+      createThumbnails();
       resolve();
     });
   
@@ -255,21 +277,41 @@ export function loadTracks(filepaths: string[])
     const fidsToFind = {} as Record<string, bigint>;
     
     filepaths.forEach((filepath) => fidsToFind[filepath] = (bigintStatSync(filepath).ino));
-    
-    const foundFids = (await TrackModel.findAll({
-      where: {
-        fid: {
-          [Op.or]: Array.from(Object.values(fidsToFind))
-        }
-      },
-      attributes: ['fid']
-    })).map(t => t.get('fid'));
+
+    const query: string = `
+      SELECT fid
+        FROM tracks
+        WHERE ${Object.values(fidsToFind).map(fid => `fid = ${fid}`).join(' OR ')}
+    `;
+
+    const foundFids = (await sqlQuery(query)).recordset.map(o => o.fid);
 
     filepaths.forEach((filepath) =>
     {
       const fid = fidsToFind[filepath].toString();
       if (foundFids.includes(fid)) {
         pathMap.set(fid, filepath);
+
+        // mm.parseFile(filepath, {
+        //   duration: false
+        // }).then(async (metadata) => {
+        //   const ret = {
+        //     album: metadata.common.album || DefaultMetadata.album!,
+        //     artist: metadata.common.artist || DefaultMetadata.artist!,
+        //     title: metadata.common.title || DefaultMetadata.title!,
+        //   } as TrackMetadata;
+
+        //   const query: string = `
+        //     UPDATE tracks
+        //       SET title = ${escapeSqlString(ret.title)},
+        //           artist = ${escapeSqlString(ret.artist)},
+        //           album = ${escapeSqlString(ret.album)}
+        //       OUTPUT inserted.title
+        //       WHERE fid = ${fid}
+        //   `;
+
+        //   console.log((await sqlQuery(query)).recordset[0]);
+        // });
       } else {
         loader.enqueue(filepath);
       }
