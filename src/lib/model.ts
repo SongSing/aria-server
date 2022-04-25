@@ -5,6 +5,37 @@ export default class Model<T = Record<string, any>> {
 
   }
 
+  forEach(method: (record: ModelRecord) => any, pageSize=1000) {
+    return new Promise((resolve, reject) => {
+      const tableName = this.tableName;
+
+      function nextPage(i: number) {
+        query(`
+          SELECT *
+            FROM ${tableName}
+            ORDER BY id
+            OFFSET ${i} ROWS
+            FETCH NEXT ${pageSize} ROWS ONLY
+        `).then((r) => {
+          const result = r.recordset;
+
+          if (result.length === 0) {
+            resolve(true);
+          }
+    
+          result.forEach((value) => {
+            const record = new ModelRecord(tableName, value);
+            method(record);
+          });
+
+          nextPage(i + pageSize);
+        });
+      }
+
+      nextPage(0);
+    })
+  }
+
   async find(id: number | string) {
     const q = `SELECT TOP(1) * FROM ${this.tableName} WHERE id = ${id}`;
     const result = (await query(q)).recordset[0] as T;

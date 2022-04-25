@@ -11,8 +11,10 @@ import { createThumbnails, initLibrary, loadTracks } from './library';
 import db, { tables } from './lib/db';
 import { filesFromDirectoryRS } from './lib/utils';
 import { Dirent } from 'fs';
+import * as fs from 'fs';
 import { initDb } from './lib/dbsql';
 import { spawnSync } from 'child_process';
+import { ListenEntries, Playlist, PlaylistTrack, Track } from './models';
 
 Promise.all([
   initDb()
@@ -54,6 +56,111 @@ async function init() {
 
   app.post('/createThumbnails', async (req, res) => {
     createThumbnails();
+  });
+
+  app.post('/createTransferFile', async (req, res) => {
+    const output = {
+      tracks: [],
+      listenEntries: [],
+      playlists: [],
+      playlistTracks: []
+    } as any;
+
+    await Track.forEach((record) => {
+      const { title, artist, album, track, volume, modified } = record.attrs;
+
+      output.tracks.push({
+        id: record.attrs.id,
+        uid: {
+          title,
+          artist,
+          album,
+          track
+        },
+        metadata: {
+          volume,
+          modified
+        }
+      });
+    });
+
+    await ListenEntries.forEach((record) => {
+      output.listenEntries.push(record.attrs);
+    });
+
+    await Playlist.forEach((record) => {
+      output.playlists.push(record.attrs);
+    });
+
+    await PlaylistTrack.forEach((record) => {
+      output.playlistTracks.push(record.attrs);
+    });
+
+    fs.writeFile('transfer.json', JSON.stringify(output), 'utf8', () => {
+      res.status(200).send({});
+    });
+  });
+
+  app.post('readFromTransferFile', async (req, res) => {
+    fs.readFile('transfer.json', 'utf8', (err, jsonString) => {
+      const json = JSON.parse(jsonString) as {
+        tracks: {
+          id: string,
+          uid: {
+            title: string,
+            artist: string,
+            album: string,
+            track: string
+          },
+          metadata: {
+            volume: number,
+            modified: string
+          }
+        }[],
+        listenEntries: {
+          trackId: string,
+          started: string,
+          ended: string
+        }[],
+        playlists: {
+          id: string,
+          name: string
+        }[],
+        playlistTracks: {
+          id: string,
+          playlistId: string,
+          trackId: string
+        }[]
+      };
+
+      const trackIdTranslations = {} as any;
+      const playlistIdTranslations = {} as any;
+
+      json.tracks.forEach(async (track) => {
+        const record = await Track.query.where(track.uid).record();
+        record?.update(track.metadata);
+        trackIdTranslations[track.id] = record?.attrs.id;
+      });
+
+      json.listenEntries.forEach(async (listenEntry) => {
+        await ListenEntries.create({
+          ...listenEntry,
+          trackId: trackIdTranslations[listenEntry.trackId]
+        });
+      });
+
+      json.playlists.forEach(async (playlist) => {
+        const record = await Playlist.create({ name: playlist.name });
+        playlistIdTranslations[playlist.id] = record.attrs.id;
+      });
+
+      json.playlistTracks.forEach(async (playlistTrack) => {
+        await PlaylistTrack.create({
+          playlistId: playlistIdTranslations[playlistTrack.playlistId],
+          trackId: trackIdTranslations[playlistTrack.trackId]
+        })
+      });
+    });
   });
 
   const server = http.createServer(app);
